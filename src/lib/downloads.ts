@@ -1,0 +1,1012 @@
+import {
+  type DbExecutor,
+  getDb,
+  queryMany,
+  queryOne,
+  withTransaction,
+} from "./db/connection.ts";
+import {
+  downloadFileTypeSchema,
+  envelopeRecordSchema,
+  type EnvelopeRecord,
+} from "./schemas/envelope.ts";
+import { fieldRecordSchema, type FieldRecord } from "./schemas/field.ts";
+import { signerRecordSchema, type SignerRecord } from "./schemas/signer.ts";
+import { listAuditEventsForEnvelope } from "./services/audit.ts";
+import {
+  type IssuedDownloadLink,
+  issueRecipientDownloadLink,
+} from "./services/downloads.ts";
+import { hashOpaqueToken } from "./services/opaque-tokens.ts";
+import {
+  renderEnvelopeCertificatePdf,
+  renderFinalizedEnvelopePdf,
+} from "./services/pdf-finalize.ts";
+import {
+  createStorageService,
+  StorageObjectNotFoundError,
+  type StorageService,
+} from "./services/storage.ts";
+import { getRecipientCertificateKey } from "./services/storage-keys.ts";
+import { type DownloadFileType } from "./types/domain.ts";
+
+type EnvelopeRow = {
+  completedAt: number | null;
+  createdAt: number;
+  declinedAt: number | null;
+  evidenceKey: string | null;
+  id: string;
+  pageCount: number;
+  sentAt: number | null;
+  signedPdfKey: string | null;
+  sourcePdfFilename: string;
+  sourcePdfHash: string;
+  sourcePdfKey: string;
+  sourcePdfSizeBytes: number;
+  evidenceSha256: string | null;
+  recipientEvidenceSha256: string | null;
+  signedPdfSha256: string | null;
+  status: EnvelopeRecord["status"];
+  title: string;
+  updatedAt: number;
+  userId: string;
+  voidedAt: number | null;
+};
+
+type RecipientDownloadTokenRow = {
+  createdAt: number;
+  envelopeId: string;
+  expiresAt: number;
+  fileType: DownloadFileType;
+  signerId: string;
+  tokenHash: string;
+};
+
+type SignerRow = {
+  createdAt: number;
+  declineReason: string | null;
+  declinedAt: number | null;
+  email: string;
+  envelopeId: string;
+  id: string;
+  lastNotifiedAt: number | null;
+  lastNudgedAt: number | null;
+  name: string;
+  signedAt: number | null;
+  signOrder: number;
+  signingTokenExpiresAt: number | null;
+  signingTokenHash: string | null;
+  status: SignerRecord["status"];
+  turnStartedAt: number | null;
+  updatedAt: number;
+};
+
+type FieldRow = {
+  checked: boolean | null;
+  createdAt: number;
+  envelopeId: string;
+  groupId: string | null;
+  height: number;
+  id: string;
+  imageKey: string | null;
+  inputMethod: FieldRecord["inputMethod"] | null;
+  label: string | null;
+  options: string[] | null;
+  page: number;
+  required: boolean;
+  signerId: string;
+  submittedAt: number | null;
+  type: FieldRecord["type"];
+  updatedAt: number;
+  value: string | null;
+  width: number;
+  x: number;
+  y: number;
+};
+
+export type ResolvedDownload = {
+  contentType: string;
+  envelopeId: string;
+  fileName: string;
+  fileType: DownloadFileType;
+  key: string;
+};
+
+export type SenderEnvelopeDownload = ResolvedDownload & {
+  body: Uint8Array;
+  contentLength: number;
+};
+
+export type EnvelopeDownloadResult = ResolvedDownload | SenderEnvelopeDownload;
+
+export class DownloadAccessError extends Error {
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode: number) {
+    super(message);
+    this.name = "DownloadAccessError";
+    this.statusCode = statusCode;
+  }
+}
+
+/** A link this site issued whose time is up. A new one can be sent. */
+export class ExpiredDownloadLinkError extends DownloadAccessError {
+  constructor() {
+    super("This download link has expired.", 410);
+    this.name = "ExpiredDownloadLinkError";
+  }
+}
+
+function mapEnvelopeRow(row: EnvelopeRow): EnvelopeRecord {
+  return envelopeRecordSchema.parse(row);
+}
+
+function mapSignerRow(row: SignerRow): SignerRecord {
+  return signerRecordSchema.parse({
+    createdAt: row.createdAt,
+    declineReason: row.declineReason ?? undefined,
+    declinedAt: row.declinedAt,
+    email: row.email,
+    envelopeId: row.envelopeId,
+    id: row.id,
+    lastNotifiedAt: row.lastNotifiedAt,
+    lastNudgedAt: row.lastNudgedAt,
+    name: row.name,
+    signOrder: row.signOrder,
+    signedAt: row.signedAt,
+    signingTokenExpiresAt: row.signingTokenExpiresAt,
+    signingTokenHash: row.signingTokenHash,
+    status: row.status,
+    turnStartedAt: row.turnStartedAt,
+    updatedAt: row.updatedAt,
+  });
+}
+
+function mapFieldRow(row: FieldRow): FieldRecord {
+  return fieldRecordSchema.parse({
+    checked: row.checked,
+    createdAt: row.createdAt,
+    envelopeId: row.envelopeId,
+    groupId: row.groupId ?? undefined,
+    height: row.height,
+    id: row.id,
+    imageKey: row.imageKey,
+    inputMethod: row.inputMethod,
+    label: row.label ?? undefined,
+    options: row.options ?? undefined,
+    page: row.page,
+    required: row.required,
+    signerId: row.signerId,
+    submittedAt: row.submittedAt,
+    type: row.type,
+    updatedAt: row.updatedAt,
+    value: row.value ?? undefined,
+    width: row.width,
+    x: row.x,
+    y: row.y,
+  });
+}
+
+async function getEnvelopeById(
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<EnvelopeRecord | null> {
+  const row = await queryOne<EnvelopeRow>(
+    database,
+    `
+      SELECT
+        id,
+        user_id AS "userId",
+        title,
+        status,
+        source_pdf_key AS "sourcePdfKey",
+        source_pdf_filename AS "sourcePdfFilename",
+        source_pdf_size_bytes AS "sourcePdfSizeBytes",
+        page_count AS "pageCount",
+        signed_pdf_key AS "signedPdfKey",
+        evidence_key AS "evidenceKey",
+        source_pdf_hash AS "sourcePdfHash",
+        signed_pdf_sha256 AS "signedPdfSha256",
+        evidence_sha256 AS "evidenceSha256",
+        recipient_evidence_sha256 AS "recipientEvidenceSha256",
+        sent_at AS "sentAt",
+        completed_at AS "completedAt",
+        declined_at AS "declinedAt",
+        voided_at AS "voidedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM envelopes
+      WHERE id = $1
+    `,
+    [envelopeId],
+  );
+
+  return row ? mapEnvelopeRow(row) : null;
+}
+
+async function getEnvelopeByIdForUser(
+  userId: string,
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<EnvelopeRecord | null> {
+  const row = await queryOne<EnvelopeRow>(
+    database,
+    `
+      SELECT
+        id,
+        user_id AS "userId",
+        title,
+        status,
+        source_pdf_key AS "sourcePdfKey",
+        source_pdf_filename AS "sourcePdfFilename",
+        source_pdf_size_bytes AS "sourcePdfSizeBytes",
+        page_count AS "pageCount",
+        signed_pdf_key AS "signedPdfKey",
+        evidence_key AS "evidenceKey",
+        source_pdf_hash AS "sourcePdfHash",
+        signed_pdf_sha256 AS "signedPdfSha256",
+        evidence_sha256 AS "evidenceSha256",
+        recipient_evidence_sha256 AS "recipientEvidenceSha256",
+        sent_at AS "sentAt",
+        completed_at AS "completedAt",
+        declined_at AS "declinedAt",
+        voided_at AS "voidedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM envelopes
+      WHERE id = $1
+        AND user_id = $2
+    `,
+    [envelopeId, userId],
+  );
+
+  return row ? mapEnvelopeRow(row) : null;
+}
+
+async function getRecipientDownloadTokenByHash(
+  tokenHash: string,
+  database: DbExecutor,
+): Promise<RecipientDownloadTokenRow | null> {
+  return queryOne<RecipientDownloadTokenRow>(
+    database,
+    `
+      SELECT
+        token_hash AS "tokenHash",
+        envelope_id AS "envelopeId",
+        signer_id AS "signerId",
+        file_type AS "fileType",
+        expires_at AS "expiresAt",
+        created_at AS "createdAt"
+      FROM recipient_download_tokens
+      WHERE token_hash = $1
+    `,
+    [tokenHash],
+  );
+}
+
+async function getSignerForEnvelope(
+  signerId: string,
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<SignerRecord | null> {
+  const row = await queryOne<SignerRow>(
+    database,
+    `
+      SELECT
+        id,
+        envelope_id AS "envelopeId",
+        name,
+        email,
+        sign_order AS "signOrder",
+        status,
+        signing_token_hash AS "signingTokenHash",
+        signing_token_expires_at AS "signingTokenExpiresAt",
+        turn_started_at AS "turnStartedAt",
+        last_notified_at AS "lastNotifiedAt",
+        last_nudged_at AS "lastNudgedAt",
+        signed_at AS "signedAt",
+        declined_at AS "declinedAt",
+        decline_reason AS "declineReason",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM signers
+      WHERE id = $1
+        AND envelope_id = $2
+    `,
+    [signerId, envelopeId],
+  );
+
+  return row ? mapSignerRow(row) : null;
+}
+
+async function listSignersForEnvelope(
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<SignerRecord[]> {
+  const rows = await queryMany<SignerRow>(
+    database,
+    `
+      SELECT
+        id,
+        envelope_id AS "envelopeId",
+        name,
+        email,
+        sign_order AS "signOrder",
+        status,
+        signing_token_hash AS "signingTokenHash",
+        signing_token_expires_at AS "signingTokenExpiresAt",
+        turn_started_at AS "turnStartedAt",
+        last_notified_at AS "lastNotifiedAt",
+        last_nudged_at AS "lastNudgedAt",
+        signed_at AS "signedAt",
+        declined_at AS "declinedAt",
+        decline_reason AS "declineReason",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM signers
+      WHERE envelope_id = $1
+        AND role = 'signer'
+      ORDER BY sign_order ASC, id ASC
+    `,
+    [envelopeId],
+  );
+
+  return rows.map(mapSignerRow);
+}
+
+/** The people who were to get a copy without signing. */
+async function listCopyRecipientsForEnvelope(
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<{ email: string; name: string }[]> {
+  return queryMany<{ email: string; name: string }>(
+    database,
+    `
+      SELECT name, email
+      FROM signers
+      WHERE envelope_id = $1
+        AND role = 'cc'
+      ORDER BY sign_order ASC, id ASC
+    `,
+    [envelopeId],
+  );
+}
+
+async function storeRecipientDownloadToken(
+  {
+    envelopeId,
+    expiresAt,
+    fileType,
+    issuedAt,
+    signerId,
+    tokenHash,
+  }: {
+    envelopeId: string;
+    expiresAt: number;
+    fileType: DownloadFileType;
+    issuedAt: number;
+    signerId: string;
+    tokenHash: string;
+  },
+  database: DbExecutor,
+) {
+  await database.query(
+    `
+      INSERT INTO recipient_download_tokens (
+        token_hash,
+        envelope_id,
+        signer_id,
+        file_type,
+        expires_at,
+        created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (envelope_id, signer_id, file_type)
+      DO UPDATE SET
+        token_hash = EXCLUDED.token_hash,
+        expires_at = EXCLUDED.expires_at,
+        created_at = EXCLUDED.created_at
+    `,
+    [tokenHash, envelopeId, signerId, fileType, expiresAt, issuedAt],
+  );
+}
+
+export async function createRecipientDownloadLink(
+  {
+    envelopeId,
+    fileType,
+    issuedAt,
+    signerId,
+  }: {
+    envelopeId: string;
+    fileType: DownloadFileType;
+    issuedAt?: number;
+    signerId: string;
+  },
+  {
+    database = getDb(),
+  }: {
+    database?: DbExecutor;
+  } = {},
+): Promise<IssuedDownloadLink> {
+  const issuedLink = await issueRecipientDownloadLink({
+    fileType,
+    issuedAt,
+  });
+
+  await storeRecipientDownloadToken(
+    {
+      envelopeId,
+      expiresAt: issuedLink.exp,
+      fileType,
+      issuedAt: issuedLink.iat,
+      signerId,
+      tokenHash: issuedLink.tokenHash,
+    },
+    database,
+  );
+
+  return issuedLink;
+}
+
+async function listFieldsForEnvelope(
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<FieldRecord[]> {
+  const rows = await queryMany<FieldRow>(
+    database,
+    `
+      SELECT
+        id,
+        envelope_id AS "envelopeId",
+        signer_id AS "signerId",
+        type,
+        page,
+        x,
+        y,
+        width,
+        height,
+        required,
+        label,
+        input_method AS "inputMethod",
+        value,
+        image_key AS "imageKey",
+        checked,
+        options,
+        group_id AS "groupId",
+        submitted_at AS "submittedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM fields
+      WHERE envelope_id = $1
+      ORDER BY page ASC, created_at ASC, id ASC
+    `,
+    [envelopeId],
+  );
+
+  return rows.map(mapFieldRow);
+}
+
+export function sanitizeFileNameSegment(value: string): string {
+  return value
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\.+$/g, "")
+    .slice(0, 120);
+}
+
+function buildDownloadFileName(
+  envelope: EnvelopeRecord,
+  fileType: DownloadFileType,
+): string {
+  const safeTitle =
+    sanitizeFileNameSegment(envelope.title) || `envelope-${envelope.id}`;
+
+  return fileType === "signed"
+    ? `${safeTitle} - signed.pdf`
+    : `${safeTitle} - certificate.pdf`;
+}
+
+function getStoredCertificateKey(
+  envelope: EnvelopeRecord,
+  redactForRecipients: boolean,
+): string | null {
+  if (
+    !envelope.evidenceKey ||
+    !envelope.evidenceKey.trim().replaceAll("\\", "/").endsWith("/internal.pdf")
+  ) {
+    return null;
+  }
+
+  return redactForRecipients
+    ? getRecipientCertificateKey(envelope.evidenceKey)
+    : envelope.evidenceKey;
+}
+
+async function buildSignedPdfDownload(
+  envelope: EnvelopeRecord,
+  database: DbExecutor,
+  storageService: StorageService,
+): Promise<EnvelopeDownloadResult> {
+  if (envelope.status !== "completed") {
+    throw new DownloadAccessError(
+      "Signed PDF downloads are available only for completed envelopes.",
+      409,
+    );
+  }
+
+  if (typeof envelope.completedAt !== "number") {
+    throw new DownloadAccessError("Signed PDF is unavailable.", 404);
+  }
+
+  if (envelope.signedPdfKey) {
+    const signedPdfObject = await storageService.headObject(
+      envelope.signedPdfKey,
+    );
+
+    if (signedPdfObject.exists) {
+      return {
+        contentType: signedPdfObject.contentType ?? "application/pdf",
+        envelopeId: envelope.id,
+        fileName: buildDownloadFileName(envelope, "signed"),
+        fileType: "signed",
+        key: signedPdfObject.key,
+      };
+    }
+  }
+
+  // A file whose fingerprint was recorded cannot be made again: a rebuilt
+  // copy would not match it, and handing one out would undo the point.
+  if (envelope.signedPdfSha256) {
+    throw new DownloadAccessError("This file is no longer available.", 404);
+  }
+
+  const [auditEvents, fields, signers] = await Promise.all([
+    listAuditEventsForEnvelope(envelope.id, database),
+    listFieldsForEnvelope(envelope.id, database),
+    listSignersForEnvelope(envelope.id, database),
+  ]);
+  let body: Uint8Array;
+
+  try {
+    body = await renderFinalizedEnvelopePdf(
+      {
+        auditEvents,
+        completedAt: envelope.completedAt,
+        envelope,
+        fields,
+        signers,
+        sourcePdfKey: envelope.sourcePdfKey,
+      },
+      {
+        storageService,
+      },
+    );
+  } catch (error) {
+    // The signed PDF is gone and so is the source it would be rebuilt from,
+    // for example after the retention period removed both.
+    // The same words as when any other stored file turns out to be gone.
+    if (error instanceof StorageObjectNotFoundError) {
+      throw new DownloadAccessError("This file is no longer available.", 404);
+    }
+
+    throw error;
+  }
+
+  if (envelope.signedPdfKey) {
+    await storageService.putObject({
+      body,
+      contentType: "application/pdf",
+      key: envelope.signedPdfKey,
+    });
+
+    return {
+      contentType: "application/pdf",
+      envelopeId: envelope.id,
+      fileName: buildDownloadFileName(envelope, "signed"),
+      fileType: "signed",
+      key: envelope.signedPdfKey,
+    };
+  }
+
+  return {
+    body,
+    contentLength: body.length,
+    contentType: "application/pdf",
+    envelopeId: envelope.id,
+    fileName: buildDownloadFileName(envelope, "signed"),
+    fileType: "signed",
+    key: envelope.signedPdfKey ?? envelope.sourcePdfKey,
+  };
+}
+
+async function buildCertificateDownload(
+  envelope: EnvelopeRecord,
+  database: DbExecutor,
+  storageService: StorageService,
+  {
+    redactForRecipients = false,
+  }: {
+    redactForRecipients?: boolean;
+  } = {},
+): Promise<EnvelopeDownloadResult> {
+  if (
+    envelope.status !== "completed" &&
+    envelope.status !== "declined" &&
+    envelope.status !== "voided"
+  ) {
+    throw new DownloadAccessError(
+      "Certificate downloads are available only after completion, decline, or void.",
+      409,
+    );
+  }
+
+  const storedCertificateKey = getStoredCertificateKey(
+    envelope,
+    redactForRecipients,
+  );
+
+  if (storedCertificateKey) {
+    const certificateObject =
+      await storageService.headObject(storedCertificateKey);
+
+    if (certificateObject.exists) {
+      return {
+        contentType: certificateObject.contentType ?? "application/pdf",
+        envelopeId: envelope.id,
+        fileName: buildDownloadFileName(envelope, "evidence"),
+        fileType: "evidence",
+        key: certificateObject.key,
+      };
+    }
+  }
+
+  if (
+    redactForRecipients
+      ? envelope.recipientEvidenceSha256
+      : envelope.evidenceSha256
+  ) {
+    throw new DownloadAccessError("This file is no longer available.", 404);
+  }
+
+  const [auditEvents, signers, copyRecipients] = await Promise.all([
+    listAuditEventsForEnvelope(envelope.id, database),
+    listSignersForEnvelope(envelope.id, database),
+    listCopyRecipientsForEnvelope(envelope.id, database),
+  ]);
+  const body = await renderEnvelopeCertificatePdf({
+    auditEvents,
+    // Only a finished envelope sends copies. A declined or voided one
+    // never did, so its certificate does not name anyone as having one.
+    copyRecipients: envelope.status === "completed" ? copyRecipients : [],
+    envelope,
+    redactForRecipients,
+    signedPdfSha256: envelope.signedPdfSha256,
+    signers,
+  });
+
+  if (storedCertificateKey) {
+    await storageService.putObject({
+      body,
+      contentType: "application/pdf",
+      key: storedCertificateKey,
+    });
+
+    return {
+      contentType: "application/pdf",
+      envelopeId: envelope.id,
+      fileName: buildDownloadFileName(envelope, "evidence"),
+      fileType: "evidence",
+      key: storedCertificateKey,
+    };
+  }
+
+  return {
+    body,
+    contentLength: body.length,
+    contentType: "application/pdf",
+    envelopeId: envelope.id,
+    fileName: buildDownloadFileName(envelope, "evidence"),
+    fileType: "evidence",
+    key: envelope.evidenceKey ?? envelope.id,
+  };
+}
+
+async function isRecipientAuthorizedForEnvelope(
+  signerId: string,
+  envelopeId: string,
+  database: DbExecutor,
+): Promise<boolean> {
+  return (await getSignerForEnvelope(signerId, envelopeId, database)) !== null;
+}
+
+export async function getSenderEnvelopeDownload(
+  userId: string,
+  envelopeId: string,
+  fileType: unknown,
+  {
+    database = getDb(),
+  }: {
+    database?: DbExecutor;
+  } = {},
+): Promise<EnvelopeDownloadResult> {
+  const parsedFileType = downloadFileTypeSchema.parse(fileType);
+  const envelope = await getEnvelopeByIdForUser(userId, envelopeId, database);
+  const storageService = createStorageService();
+
+  if (!envelope) {
+    throw new DownloadAccessError("Envelope not found.", 404);
+  }
+
+  if (parsedFileType === "signed") {
+    return buildSignedPdfDownload(envelope, database, storageService);
+  }
+
+  return buildCertificateDownload(envelope, database, storageService);
+}
+
+export async function getPublicEnvelopeDownloadForToken(
+  token: string,
+  {
+    database = getDb(),
+  }: {
+    database?: DbExecutor;
+  } = {},
+): Promise<EnvelopeDownloadResult> {
+  const storageService = createStorageService();
+  const tokenRow = await getRecipientDownloadTokenByHash(
+    hashOpaqueToken(token),
+    database,
+  );
+  const now = Math.floor(Date.now() / 1000);
+
+  if (!tokenRow) {
+    throw new DownloadAccessError(
+      "This download link is invalid or has expired.",
+      410,
+    );
+  }
+
+  if (tokenRow.expiresAt <= now) {
+    throw new ExpiredDownloadLinkError();
+  }
+
+  const envelope = await getEnvelopeById(tokenRow.envelopeId, database);
+
+  if (!envelope) {
+    throw new DownloadAccessError(
+      "This download link is invalid or has expired.",
+      410,
+    );
+  }
+
+  if (
+    !(await isRecipientAuthorizedForEnvelope(
+      tokenRow.signerId,
+      envelope.id,
+      database,
+    ))
+  ) {
+    throw new DownloadAccessError(
+      "This download link is invalid or has expired.",
+      410,
+    );
+  }
+
+  const fileType = downloadFileTypeSchema.parse(tokenRow.fileType);
+
+  if (fileType === "signed") {
+    return buildSignedPdfDownload(envelope, database, storageService);
+  }
+
+  return buildCertificateDownload(envelope, database, storageService, {
+    redactForRecipients: true,
+  });
+}
+
+export type RenewedDownloadLinks = {
+  /** The signer's address with most of it hidden, to show on the page. */
+  maskedEmail: string;
+};
+
+function maskEmail(email: string): string {
+  const [local = "", domain = ""] = email.split("@");
+
+  return `${local.slice(0, 1)}${"*".repeat(Math.max(1, local.length - 1))}@${domain}`;
+}
+
+function isPool(database: DbExecutor): database is ReturnType<typeof getDb> {
+  return "connect" in database && "totalCount" in database;
+}
+
+type StoredDownloadToken = {
+  createdAt: number;
+  expiresAt: number;
+  fileType: string;
+  tokenHash: string;
+};
+
+/**
+ * Puts a new pair of links in place of a signer's stored ones and returns
+ * the old rows. Call it inside a transaction. The signer's rows are locked
+ * first, so two renewals for the same signer take turns, and the links are
+ * stored together or not at all.
+ */
+async function replaceRecipientDownloadLinks(
+  {
+    envelope,
+    presentedTokenHash,
+    signerId,
+  }: {
+    envelope: EnvelopeRecord;
+    presentedTokenHash: string;
+    signerId: string;
+  },
+  tx: DbExecutor,
+): Promise<{
+  evidenceLink: IssuedDownloadLink;
+  previousTokens: StoredDownloadToken[];
+  signedLink: IssuedDownloadLink | null;
+}> {
+  const previousTokens = await queryMany<StoredDownloadToken>(
+    tx,
+    `
+      SELECT
+        token_hash AS "tokenHash",
+        file_type AS "fileType",
+        expires_at AS "expiresAt",
+        created_at AS "createdAt"
+      FROM recipient_download_tokens
+      WHERE envelope_id = $1 AND signer_id = $2
+      ORDER BY file_type
+      FOR UPDATE
+    `,
+    [envelope.id, signerId],
+  );
+
+  // A renewal that got the lock first has already replaced the link this
+  // request came with, and its email carries the pair that works. Sending
+  // a second pair would leave that email with dead links.
+  if (!previousTokens.some((row) => row.tokenHash === presentedTokenHash)) {
+    throw new DownloadAccessError(
+      "This download link is invalid or has expired.",
+      410,
+    );
+  }
+
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const signedLink =
+    envelope.status === "completed"
+      ? await createRecipientDownloadLink(
+          {
+            envelopeId: envelope.id,
+            fileType: "signed",
+            issuedAt,
+            signerId,
+          },
+          { database: tx },
+        )
+      : null;
+  const evidenceLink = await createRecipientDownloadLink(
+    {
+      envelopeId: envelope.id,
+      fileType: "evidence",
+      issuedAt,
+      signerId,
+    },
+    { database: tx },
+  );
+
+  return { evidenceLink, previousTokens, signedLink };
+}
+
+/**
+ * Someone holding an expired download link asks for a new one. The new links
+ * go only to the signer's own address on record, never anywhere the request
+ * names, so holding an old link gains nothing a forwarded email did not.
+ */
+export async function renewRecipientDownloadLinks(
+  token: string,
+  {
+    database = getDb(),
+    sendLinks,
+  }: {
+    database?: DbExecutor;
+    sendLinks: (input: {
+      envelope: EnvelopeRecord;
+      evidenceUrl: string;
+      signedUrl: string | null;
+      signer: SignerRecord;
+    }) => Promise<void>;
+  },
+): Promise<RenewedDownloadLinks> {
+  const presentedTokenHash = hashOpaqueToken(token);
+  const tokenRow = await getRecipientDownloadTokenByHash(
+    presentedTokenHash,
+    database,
+  );
+  const envelope = tokenRow
+    ? await getEnvelopeById(tokenRow.envelopeId, database)
+    : null;
+  const signer =
+    tokenRow && envelope
+      ? await getSignerForEnvelope(tokenRow.signerId, envelope.id, database)
+      : null;
+
+  if (
+    !tokenRow ||
+    !envelope ||
+    !signer?.id ||
+    (envelope.status !== "completed" &&
+      envelope.status !== "declined" &&
+      envelope.status !== "voided")
+  ) {
+    throw new DownloadAccessError(
+      "This download link is invalid or has expired.",
+      410,
+    );
+  }
+
+  const signerId = signer.id;
+  const replaceLinks = (tx: DbExecutor) =>
+    replaceRecipientDownloadLinks(
+      { envelope, presentedTokenHash, signerId },
+      tx,
+    );
+  // The new links are stored in a transaction of their own, which ends
+  // before the email is sent: a database connection is not held while the
+  // mail provider answers.
+  const { evidenceLink, previousTokens, signedLink } = isPool(database)
+    ? await withTransaction(replaceLinks, database)
+    : await replaceLinks(database);
+
+  try {
+    await sendLinks({
+      envelope,
+      evidenceUrl: evidenceLink.url,
+      signedUrl: signedLink?.url ?? null,
+      signer,
+    });
+  } catch (error) {
+    const issuedHashes = new Map<string, string>([
+      ["evidence", evidenceLink.tokenHash],
+      ...(signedLink
+        ? [["signed", signedLink.tokenHash] as [string, string]]
+        : []),
+    ]);
+    // The email did not go out, so the old links go back, both or neither,
+    // and the signer can ask again.
+    const restoreLinks = async (tx: DbExecutor) => {
+      for (const previous of previousTokens) {
+        // Only where this request's link is still the stored one.
+        await tx.query(
+          `
+            UPDATE recipient_download_tokens
+            SET token_hash = $1, expires_at = $2, created_at = $3
+            WHERE envelope_id = $4 AND signer_id = $5 AND file_type = $6
+              AND token_hash = $7
+          `,
+          [
+            previous.tokenHash,
+            previous.expiresAt,
+            previous.createdAt,
+            envelope.id,
+            signerId,
+            previous.fileType,
+            issuedHashes.get(previous.fileType) ?? "",
+          ],
+        );
+      }
+    };
+
+    if (isPool(database)) {
+      await withTransaction(restoreLinks, database);
+    } else {
+      await restoreLinks(database);
+    }
+
+    throw error;
+  }
+
+  return { maskedEmail: maskEmail(signer.email) };
+}
